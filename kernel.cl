@@ -10,8 +10,10 @@ __kernel void updateBalls(
     const float windowWidth,
     const float windowHeight
 ) {
-    __local float4 local_pos[16];   // Local storage for positions
-    __local float4 local_vel[16];   // Local storage for velocities
+    __local float4 local_pos[16];
+    __local float4 local_vel[16];
+    __local float4 collision_impacts[16];
+    __local int collision_counts[16];  // Track number of collisions per ball
     
     int global_id = get_global_id(0);
     int local_id = get_local_id(0);
@@ -20,100 +22,125 @@ __kernel void updateBalls(
     
     if (ball_idx >= numBalls) return;
     
-    // Load ball data into local memory
+    // Initialize local memory
     if (thread_idx == 0) {
+        collision_impacts[ball_idx] = (float4)(0.0f, 0.0f, 0.0f, 0.0f);
+        collision_counts[ball_idx] = 0;
         local_pos[ball_idx] = positions[ball_idx];
         local_vel[ball_idx] = velocities[ball_idx];
     }
     barrier(CLK_LOCAL_MEM_FENCE);
     
-    // Get local copy of ball data
     float4 pos = local_pos[ball_idx];
     float4 vel = local_vel[ball_idx];
     
-    // Update position and apply gravity - only one thread per ball
+    // Phase 1: Update positions (single thread per ball)
     if (thread_idx == 0) {
         vel.y += gravity;
         pos.x += vel.x;
         pos.y += vel.y;
+    }
+    barrier(CLK_LOCAL_MEM_FENCE);
+    
+    // Phase 2: Boundary collisions (single thread per ball)
+    if (thread_idx == 0) {
+        bool collided = false;
+        float dampening = 0.95f;
         
-        // Handle boundary collisions
+        // X boundaries
         if (pos.x - pos.z < 0) {
             pos.x = pos.z;
-            vel.x = -vel.x * 0.95f;
-        }
-        if (pos.x + pos.z > windowWidth) {
+            vel.x = -vel.x * dampening;
+            collided = true;
+        } else if (pos.x + pos.z > windowWidth) {
             pos.x = windowWidth - pos.z;
-            vel.x = -vel.x * 0.95f;
-        }
-        if (pos.y - pos.z < 0) {
-            pos.y = pos.z;
-            vel.y = -vel.y * 0.95f;
-        }
-        if (pos.y + pos.z > windowHeight) {
-            pos.y = windowHeight - pos.z;
-            vel.y = -vel.y * 0.95f;
+            vel.x = -vel.x * dampening;
+            collided = true;
         }
         
-        // Update local memory
+        // Y boundaries
+        if (pos.y - pos.z < 0) {
+            pos.y = pos.z;
+            vel.y = -vel.y * dampening;
+            collided = true;
+        } else if (pos.y + pos.z > windowHeight) {
+            pos.y = windowHeight - pos.z;
+            vel.y = -vel.y * dampening;
+            collided = true;
+        }
+        
         local_pos[ball_idx] = pos;
         local_vel[ball_idx] = vel;
     }
     barrier(CLK_LOCAL_MEM_FENCE);
     
-    // Parallel collision detection
-    if (thread_idx < numBalls) {
-        int other_idx = thread_idx;
-        if (other_idx != ball_idx) {
-            float4 other_pos = local_pos[other_idx];
-            float4 other_vel = local_vel[other_idx];
+    // Phase 3: Ball-to-ball collisions
+    if (thread_idx < numBalls && thread_idx != ball_idx) {
+        float4 other_pos = local_pos[thread_idx];
+        float4 other_vel = local_vel[thread_idx];
+        
+        float dx = other_pos.x - pos.x;
+        float dy = other_pos.y - pos.y;
+        float distance = sqrt(dx * dx + dy * dy);
+        float minDist = pos.z + other_pos.z;
+        
+        if (distance < minDist && distance > 0.0f) {
+            // Normalized collision vector
+            float nx = dx / distance;
+            float ny = dy / distance;
             
-            float dx = other_pos.x - pos.x;
-            float dy = other_pos.y - pos.y;
-            float distance = sqrt(dx * dx + dy * dy);
-            float minDist = pos.z + other_pos.z;
-            
-            if (distance < minDist && distance > 0.0f) {
-                float nx = dx / distance;
-                float ny = dy / distance;
-                
-                float overlap = minDist - distance;
+            // Separate the balls
+            float overlap = minDist - distance;
+            if (ball_idx < thread_idx) {
                 pos.x -= nx * overlap * 0.5f;
                 pos.y -= ny * overlap * 0.5f;
+            }
+            
+            // Relative velocity
+            float rvx = other_vel.x - vel.x;
+            float rvy = other_vel.y - vel.y;
+            float velAlongNormal = rvx * nx + rvy * ny;
+            
+            // Only resolve if objects are moving toward each other
+            if (velAlongNormal < 0) {
+                float restitution = 0.8f;
+                float j = -(1.0f + restitution) * velAlongNormal;
                 
-                float rvx = other_vel.x - vel.x;
-                float rvy = other_vel.y - vel.y;
-                float velAlongNormal = rvx * nx + rvy * ny;
+                // Store collision impact
+                float4 impact = collision_impacts[ball_idx];
+                impact.x += -j * nx;
+                impact.y += -j * ny;
+                collision_impacts[ball_idx] = impact;
                 
-                if (velAlongNormal < 0) {
-                    float restitution = 0.8f;
-                    float j = -(1.0f + restitution) * velAlongNormal;
-                    j /= 2.0f;
-                    
-                    vel.x -= j * nx;
-                    vel.y -= j * ny;
-                }
+                // Increment collision count
+                atomic_inc(&collision_counts[ball_idx]);
             }
         }
     }
     barrier(CLK_LOCAL_MEM_FENCE);
     
-    // Write back results - only first thread per ball
+    // Phase 4: Apply collision impacts and write back results (single thread per ball)
     if (thread_idx == 0) {
-        float4 final_pos = pos;
-        float4 final_vel = vel;
+        // Apply accumulated collision impacts with scaling
+        float4 impact = collision_impacts[ball_idx];
+        int count = collision_counts[ball_idx];
         
-        // Apply velocity limits
-        float maxSpeed = 10.0f;
-        float speedSq = final_vel.x * final_vel.x + final_vel.y * final_vel.y;
-        if (speedSq > maxSpeed * maxSpeed) {
-            float scale = maxSpeed / sqrt(speedSq);
-            final_vel.x *= scale;
-            final_vel.y *= scale;
+        if (count > 0) {
+            // Scale the impact by number of collisions to prevent energy gain
+            vel.x += impact.x / (float)count;
+            vel.y += impact.y / (float)count;
         }
         
-        // Write to global memory
-        positions[ball_idx] = final_pos;
-        velocities[ball_idx] = final_vel;
+        // Apply velocity limits
+        float maxSpeed = 5.0f;  // Reduced max speed
+        float speedSq = vel.x * vel.x + vel.y * vel.y;
+        if (speedSq > maxSpeed * maxSpeed) {
+            float scale = maxSpeed / sqrt(speedSq);
+            vel.x *= scale;
+            vel.y *= scale;
+        }
+        
+        positions[ball_idx] = pos;
+        velocities[ball_idx] = vel;
     }
 }
