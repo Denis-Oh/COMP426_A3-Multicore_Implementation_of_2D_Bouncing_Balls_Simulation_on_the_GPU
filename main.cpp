@@ -97,12 +97,6 @@ void initOpenCL() {
         CL_KERNEL_WORK_GROUP_SIZE, sizeof(size_t), &max_work_group_size, NULL);
     checkError(error, "clGetKernelWorkGroupInfo");
     
-    // Print device info
-    char device_name[256];
-    error = clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(device_name), device_name, NULL);
-    checkError(error, "clGetDeviceInfo");
-    
-    std::cout << "Using device: " << device_name << std::endl;
     std::cout << "Maximum work group size: " << max_work_group_size << std::endl;
 }
 
@@ -350,9 +344,9 @@ int main() {
                 frame_count = 0;
             }
             
-            if (duration.count() < 33) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(33 - duration.count()));
-            }
+            // if (duration.count() < 33) {
+            //     std::this_thread::sleep_for(std::chrono::milliseconds(33 - duration.count()));
+            // }
         }
     } catch (const std::exception& e) {
         std::cerr << "Error: " << e.what() << std::endl;

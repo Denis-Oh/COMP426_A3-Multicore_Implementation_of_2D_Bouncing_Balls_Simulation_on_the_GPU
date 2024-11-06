@@ -1,7 +1,8 @@
 {
     "files.associations": {
         "*.cl": "opencl",
-        "*.clh": "opencl"
+        "*.clh": "opencl",
+        "string": "cpp"
     },
     "opencl.formatting.enable": true,
     "[opencl]": {
