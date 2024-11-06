@@ -1,204 +1,367 @@
 #include <GLFW/glfw3.h>
-#include <tbb/tbb.h>
-#include <tbb/concurrent_vector.h>
-#include <tbb/parallel_for.h>
-#include <tbb/task_group.h>
+#include <OpenCL/opencl.h>
 #include <vector>
+#include <fstream>
+#include <iostream>
 #include <cmath>
 #include <cstdlib>
 #include <ctime>
+#include <chrono>
+#include <thread>
 
 struct Ball {
-    float x, y;          // Position
-    float vx, vy;        // Velocity
-    float radius;        // Radius
-    float r, g, b;       // Color (RGB)
+    cl_float4 position;  // x, y, radius, padding
+    cl_float4 velocity;  // vx, vy, padding, padding
+    cl_float4 color;     // r, g, b, padding
 };
 
-// TBB concurrent vector to store multiple balls
-tbb::concurrent_vector<Ball> balls;
+std::vector<Ball> balls;
+cl_context context;
+cl_command_queue queue;
+cl_program program;
+cl_kernel kernel;
+cl_mem d_positions, d_velocities, d_colors;
 
-// Gravity constant
-const float gravity = -0.03f;
-
-// Function to handle ball collision response
-void handleCollision(Ball &ball1, Ball &ball2) {
-    // Calculate the distance between the centers of the two balls
-    float dx = ball2.x - ball1.x;
-    float dy = ball2.y - ball1.y;
-    float distance = std::sqrt(dx * dx + dy * dy);
-
-    // Check if the balls are colliding
-    if (distance < ball1.radius + ball2.radius) {
-        // Normalize the collision vector
-        float nx = dx / distance;
-        float ny = dy / distance;
-
-        // Calculate relative velocity
-        float vx_relative = ball2.vx - ball1.vx;
-        float vy_relative = ball2.vy - ball1.vy;
-
-        // Calculate the velocity along the normal direction
-        float velocity_along_normal = vx_relative * nx + vy_relative * ny;
-
-        // If the balls are moving apart, don't calculate the collision
-        if (velocity_along_normal > 0) return;
-
-        // Adjust the velocities to simulate the collision
-        float bounce = 1.0f; // bounciness (max 1.0 = no energy lost in collision)
-
-        float impulse = (-(1 + bounce) * velocity_along_normal) / 2.0f;
-
-        // Apply impulse to both balls
-        ball1.vx -= impulse * nx;
-        ball1.vy -= impulse * ny;
-        ball2.vx += impulse * nx;
-        ball2.vy += impulse * ny;
+// Function to check OpenCL errors
+void checkError(cl_int error, const char* location) {
+    if (error != CL_SUCCESS) {
+        std::cerr << "OpenCL error at " << location << ": " << error << std::endl;
+        exit(error);
     }
 }
 
-// Updated function to update ball position and handle collisions
-void updateBall(Ball &ball) {
-    // Apply gravity to the ball's y-velocity
-    ball.vy += gravity;
-
-    // Update ball position
-    ball.x += ball.vx;
-    ball.y += ball.vy;
-
-    // Bounce off the window boundaries
-    if (ball.x - ball.radius < 0) {
-        ball.x = ball.radius;
-        ball.vx = -ball.vx;
+// Function to load and compile OpenCL kernel
+std::string loadKernel(const char* filename) {
+    std::ifstream file(filename);
+    if (!file.is_open()) {
+        std::cerr << "Failed to open kernel file: " << filename << std::endl;
+        exit(1);
     }
-    if (ball.x + ball.radius > 800) {
-        ball.x = 800 - ball.radius;
-        ball.vx = -ball.vx;
-    }
-    if (ball.y - ball.radius < 0) {
-        ball.y = ball.radius;
-        ball.vy = -ball.vy;
-    }
-    if (ball.y + ball.radius > 600) {
-        ball.y = 600 - ball.radius;
-        ball.vy = -ball.vy;
-    }
-
-    // Check for collisions with other balls
-    for (auto& other : balls) {
-        if (&ball != &other) {
-            handleCollision(ball, other);
-        }
-    }
+    return std::string(
+        std::istreambuf_iterator<char>(file),
+        std::istreambuf_iterator<char>()
+    );
 }
 
-// Function to initialize balls
+void initOpenCL() {
+    cl_int error;
+    cl_device_id device;  // Declare device here to use it later
+    
+    // Get platform
+    cl_platform_id platform;
+    cl_uint num_platforms;
+    error = clGetPlatformIDs(1, &platform, &num_platforms);
+    checkError(error, "clGetPlatformIDs");
+    
+    // Get device
+    cl_uint num_devices;
+    error = clGetDeviceIDs(platform, CL_DEVICE_TYPE_GPU, 1, &device, &num_devices);
+    checkError(error, "clGetDeviceIDs");
+    
+    // Create context
+    context = clCreateContext(nullptr, 1, &device, nullptr, nullptr, &error);
+    checkError(error, "clCreateContext");
+    
+    // Create command queue
+    queue = clCreateCommandQueue(context, device, 0, &error);
+    checkError(error, "clCreateCommandQueue");
+    
+    // Load and build program
+    std::string kernel_source = loadKernel("kernel.cl");
+    const char* source_ptr = kernel_source.c_str();
+    size_t source_len = kernel_source.length();
+    program = clCreateProgramWithSource(context, 1, &source_ptr, &source_len, &error);
+    checkError(error, "clCreateProgramWithSource");
+    
+    error = clBuildProgram(program, 1, &device, nullptr, nullptr, nullptr);
+    if (error != CL_SUCCESS) {
+        // Get build log size
+        size_t log_size;
+        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, 0, nullptr, &log_size);
+        
+        // Get build log
+        std::vector<char> log(log_size);
+        clGetProgramBuildInfo(program, device, CL_PROGRAM_BUILD_LOG, log_size, log.data(), nullptr);
+        
+        std::cerr << "OpenCL build error:\n" << log.data() << std::endl;
+        exit(error);
+    }
+    
+    // Create kernel
+    kernel = clCreateKernel(program, "updateBalls", &error);
+    checkError(error, "clCreateKernel");
+    
+    // Get maximum work group size
+    size_t max_work_group_size;
+    error = clGetKernelWorkGroupInfo(kernel, device, 
+        CL_KERNEL_WORK_GROUP_SIZE, sizeof(size_t), &max_work_group_size, NULL);
+    checkError(error, "clGetKernelWorkGroupInfo");
+    
+    // Print device info
+    char device_name[256];
+    error = clGetDeviceInfo(device, CL_DEVICE_NAME, sizeof(device_name), device_name, NULL);
+    checkError(error, "clGetDeviceInfo");
+    
+    std::cout << "Using device: " << device_name << std::endl;
+    std::cout << "Maximum work group size: " << max_work_group_size << std::endl;
+}
+
 void initializeBalls(int numBalls) {
     srand(static_cast<unsigned int>(time(0)));
+    balls.resize(numBalls);
+    
+    // Fixed starting positions for debugging
+    float positions_init[5][2] = {
+        {200, 300}, {400, 300}, {600, 300}, {300, 450}, {500, 450}
+    };
+    float velocities_init[5][2] = {
+        {2.0f, 0.0f}, {-2.0f, 0.0f}, {2.0f, 0.0f}, {-2.0f, 0.0f}, {2.0f, 0.0f}
+    };
+    
+    std::cout << "Initializing balls:" << std::endl;
+    
+    // Create separate vectors for each component
+    std::vector<cl_float4> positions(numBalls);
+    std::vector<cl_float4> velocities(numBalls);
+    std::vector<cl_float4> colors(numBalls);
+    
     for (int i = 0; i < numBalls; ++i) {
-        Ball ball;
-        ball.x = static_cast<float>(rand() % 800);
-        ball.y = static_cast<float>(rand() % 600);
-        ball.vx = static_cast<float>((rand() % 200) - 100) / 100.0f; // Random velocity between -1.00 and 1.00
-        ball.vy = static_cast<float>((rand() % 200) - 100) / 100.0f;
-        ball.radius = static_cast<float>((rand() % 3 + 1) * 25); // Random radius (25, 50, or 75)
-
-        // Assign random colors (red, green, or blue)
+        // Set up positions
+        positions[i].s[0] = positions_init[i][0];    // x
+        positions[i].s[1] = positions_init[i][1];    // y
+        positions[i].s[2] = 50.0f;                   // radius
+        positions[i].s[3] = 0.0f;                    // padding
+        
+        // Set up velocities
+        velocities[i].s[0] = velocities_init[i][0];  // vx
+        velocities[i].s[1] = velocities_init[i][1];  // vy
+        velocities[i].s[2] = 0.0f;                   // padding
+        velocities[i].s[3] = 0.0f;                   // padding
+        
+        // Set up colors
         if (i % 3 == 0) {
-            ball.r = 1.0f; ball.g = 0.0f; ball.b = 0.0f; // Red
+            colors[i].s[0] = 1.0f; colors[i].s[1] = 0.0f; colors[i].s[2] = 0.0f;  // Red
         } else if (i % 3 == 1) {
-            ball.r = 0.0f; ball.g = 1.0f; ball.b = 0.0f; // Green
+            colors[i].s[0] = 0.0f; colors[i].s[1] = 1.0f; colors[i].s[2] = 0.0f;  // Green
         } else {
-            ball.r = 0.0f; ball.g = 0.0f; ball.b = 1.0f; // Blue
+            colors[i].s[0] = 0.0f; colors[i].s[1] = 0.0f; colors[i].s[2] = 1.0f;  // Blue
         }
-
-        balls.push_back(std::move(ball));
+        colors[i].s[3] = 0.0f;  // padding
+        
+        // Store in balls array for CPU-side reference
+        balls[i].position = positions[i];
+        balls[i].velocity = velocities[i];
+        balls[i].color = colors[i];
+        
+        std::cout << "Ball " << i << ": "
+                  << "pos=(" << positions[i].s[0] << "," << positions[i].s[1] << ") "
+                  << "vel=(" << velocities[i].s[0] << "," << velocities[i].s[1] << ")"
+                  << std::endl;
     }
+    
+    cl_int error;
+    
+    // Create buffers
+    d_positions = clCreateBuffer(context, CL_MEM_READ_WRITE, 
+        sizeof(cl_float4) * numBalls, nullptr, &error);
+    checkError(error, "clCreateBuffer positions");
+    
+    d_velocities = clCreateBuffer(context, CL_MEM_READ_WRITE,
+        sizeof(cl_float4) * numBalls, nullptr, &error);
+    checkError(error, "clCreateBuffer velocities");
+    
+    d_colors = clCreateBuffer(context, CL_MEM_READ_WRITE,
+        sizeof(cl_float4) * numBalls, nullptr, &error);
+    checkError(error, "clCreateBuffer colors");
+    
+    // Copy data to device using the separate vectors
+    error = clEnqueueWriteBuffer(queue, d_positions, CL_TRUE, 0,
+        sizeof(cl_float4) * numBalls, positions.data(), 0, nullptr, nullptr);
+    checkError(error, "clEnqueueWriteBuffer positions");
+    
+    error = clEnqueueWriteBuffer(queue, d_velocities, CL_TRUE, 0,
+        sizeof(cl_float4) * numBalls, velocities.data(), 0, nullptr, nullptr);
+    checkError(error, "clEnqueueWriteBuffer velocities");
+    
+    error = clEnqueueWriteBuffer(queue, d_colors, CL_TRUE, 0,
+        sizeof(cl_float4) * numBalls, colors.data(), 0, nullptr, nullptr);
+    checkError(error, "clEnqueueWriteBuffer colors");
+    
+    std::cout << "Initialization complete" << std::endl;
 }
 
-// Function to draw a ball
-void drawBall(const Ball& ball) {
-    glColor3f(ball.r, ball.g, ball.b);
-    glBegin(GL_TRIANGLE_FAN);
-    glVertex2f(ball.x, ball.y); // Define center of the ball
+void drawBalls() {
+    // Read back all data
+    std::vector<cl_float4> positions(balls.size());
+    std::vector<cl_float4> velocities(balls.size());
+    std::vector<cl_float4> colors(balls.size());
+    
+    cl_int error = clEnqueueReadBuffer(queue, d_positions, CL_TRUE, 0,
+        sizeof(cl_float4) * balls.size(), positions.data(), 0, nullptr, nullptr);
+    checkError(error, "clEnqueueReadBuffer positions");
+    
+    error = clEnqueueReadBuffer(queue, d_velocities, CL_TRUE, 0,
+        sizeof(cl_float4) * balls.size(), velocities.data(), 0, nullptr, nullptr);
+    checkError(error, "clEnqueueReadBuffer velocities");
+    
+    error = clEnqueueReadBuffer(queue, d_colors, CL_TRUE, 0,
+        sizeof(cl_float4) * balls.size(), colors.data(), 0, nullptr, nullptr);
+    checkError(error, "clEnqueueReadBuffer colors");
 
-    // Draw the ball as a circle
-    for (int i = 0; i <= 360; ++i) {
-        float angle = i * 3.14159f / 180.0f; // convert i to radians
-        glVertex2f(ball.x + cos(angle) * ball.radius, ball.y + sin(angle) * ball.radius); // Define all points around ball's edge
+    // Print debug info
+    static int frame_count = 0;
+    if (frame_count++ % 60 == 0) {  // Print every 60 frames
+        std::cout << "\nBall States:" << std::endl;
+        for (size_t i = 0; i < balls.size(); i++) {
+            std::cout << "Ball " << i << ": "
+                      << "pos=(" << positions[i].s[0] << "," << positions[i].s[1] << ") "
+                      << "vel=(" << velocities[i].s[0] << "," << velocities[i].s[1] << ")"
+                      << std::endl;
+        }
+        std::cout << std::endl;
     }
-    glEnd();
-}
 
-// Control thread function
-void controlThread(GLFWwindow* window) {
-    tbb::task_group group;
-
-    while (!glfwWindowShouldClose(window)) {
-        auto start = std::chrono::high_resolution_clock::now();
-
-        // Update ball positions in parallel
-        group.run([&]{
-            tbb::parallel_for(tbb::blocked_range<size_t>(0, balls.size()),
-                [&](const tbb::blocked_range<size_t>& r) {
-                    for (size_t i = r.begin(); i != r.end(); ++i) {
-                        updateBall(balls[i]);
-                    }
-                }
+    // Draw balls
+    for (size_t i = 0; i < balls.size(); i++) {
+        glColor3f(colors[i].s[0], colors[i].s[1], colors[i].s[2]);
+        glBegin(GL_TRIANGLE_FAN);
+        glVertex2f(positions[i].s[0], positions[i].s[1]);
+        
+        for (int j = 0; j <= 360; ++j) {
+            float angle = j * 3.14159f / 180.0f;
+            glVertex2f(
+                positions[i].s[0] + cos(angle) * positions[i].s[2],
+                positions[i].s[1] + sin(angle) * positions[i].s[2]
             );
-        });
-
-        group.wait();
-
-        // Render
-        glClear(GL_COLOR_BUFFER_BIT);
-
-        // Draw all balls
-        for (const auto& ball : balls) {
-            drawBall(ball);
         }
-
-        glfwSwapBuffers(window);
-        glfwPollEvents();
-
-        auto end = std::chrono::high_resolution_clock::now();
-        auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
-
-        // Sleep for 30 FPS
-        if (duration.count() < 33) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(33 - duration.count()));
-        }
+        glEnd();
     }
+}
+
+void cleanupOpenCL() {
+    clReleaseMemObject(d_positions);
+    clReleaseMemObject(d_velocities);
+    clReleaseMemObject(d_colors);
+    clReleaseKernel(kernel);
+    clReleaseProgram(program);
+    clReleaseCommandQueue(queue);
+    clReleaseContext(context);
 }
 
 int main() {
     if (!glfwInit()) return -1;
-
-    GLFWwindow* window = glfwCreateWindow(800, 600, "TBB 2D Bouncing Balls Simulation", NULL, NULL);
+    
+    GLFWwindow* window = glfwCreateWindow(800, 600, "OpenCL 2D Bouncing Balls", NULL, NULL);
     if (!window) {
         glfwTerminate();
         return -1;
     }
-
+    
     glfwMakeContextCurrent(window);
-
-    // Set up the OpenGL viewport and projection
+    
+    // Initialize OpenGL
     glViewport(0, 0, 800, 600);
     glMatrixMode(GL_PROJECTION);
-    glLoadIdentity(); // reset the current matrix to the identity matrix
+    glLoadIdentity();
     glOrtho(0, 800, 0, 600, -1, 1);
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
+    glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
+    
+    try {
+        // Initialize OpenCL
+        initOpenCL();
+        initializeBalls(5);
+        
+        // Set kernel arguments
+        cl_int error;
+        error = clSetKernelArg(kernel, 0, sizeof(cl_mem), &d_positions);
+        checkError(error, "clSetKernelArg 0");
+        error = clSetKernelArg(kernel, 1, sizeof(cl_mem), &d_velocities);
+        checkError(error, "clSetKernelArg 1");
+        error = clSetKernelArg(kernel, 2, sizeof(cl_mem), &d_colors);
+        checkError(error, "clSetKernelArg 2");
+        
+        int num_balls = balls.size();
+        error = clSetKernelArg(kernel, 3, sizeof(int), &num_balls);
+        checkError(error, "clSetKernelArg 3");
+        
+        float gravity = -0.03f;
+        error = clSetKernelArg(kernel, 4, sizeof(float), &gravity);
+        checkError(error, "clSetKernelArg 4");
+        
+        float window_width = 800.0f;
+        error = clSetKernelArg(kernel, 5, sizeof(float), &window_width);
+        checkError(error, "clSetKernelArg 5");
+        
+        float window_height = 600.0f;
+        error = clSetKernelArg(kernel, 6, sizeof(float), &window_height);
+        checkError(error, "clSetKernelArg 6");
+        
+        // Set up work sizes for parallel execution
+        const int THREADS_PER_BALL = 32;
+        const int LOCAL_SIZE = 256;
+        size_t global_work_size = ((balls.size() * THREADS_PER_BALL + LOCAL_SIZE - 1) / LOCAL_SIZE) * LOCAL_SIZE;
+        size_t local_work_size = LOCAL_SIZE;
 
-    // Set the background color to black
-    glClearColor(0.0f, 0.0f, 0.0f, 1.0f); 
-
-    // Initialize balls
-    initializeBalls(5);
-
-    // Start the control thread
-    controlThread(window);
-
+        std::cout << "Global work size: " << global_work_size << std::endl;
+        std::cout << "Local work size: " << local_work_size << std::endl;
+        
+        // Performance measurement variables
+        float total_frame_time = 0.0f;
+        int frame_count = 0;
+        
+        while (!glfwWindowShouldClose(window)) {
+            auto start = std::chrono::high_resolution_clock::now();
+            
+            // Launch kernel with parallel configuration
+            error = clEnqueueNDRangeKernel(
+                queue,
+                kernel,
+                1,              // One dimension
+                nullptr,        // Global work offset
+                &global_work_size,
+                &local_work_size,
+                0, nullptr, nullptr
+            );
+            checkError(error, "clEnqueueNDRangeKernel");
+            
+            error = clFinish(queue);
+            checkError(error, "clFinish");
+            
+            // Render
+            glClear(GL_COLOR_BUFFER_BIT);
+            drawBalls();
+            glfwSwapBuffers(window);
+            glfwPollEvents();
+            
+            auto end = std::chrono::high_resolution_clock::now();
+            auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end - start);
+            
+            // Frame timing and performance metrics
+            total_frame_time += duration.count();
+            frame_count++;
+            
+            if (frame_count % 100 == 0) {
+                float avg_frame_time = total_frame_time / frame_count;
+                float fps = 1000.0f / avg_frame_time;
+                std::cout << "Average frame time: " << avg_frame_time << "ms (" << fps << " FPS)" << std::endl;
+                total_frame_time = 0;
+                frame_count = 0;
+            }
+            
+            if (duration.count() < 33) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(33 - duration.count()));
+            }
+        }
+    } catch (const std::exception& e) {
+        std::cerr << "Error: " << e.what() << std::endl;
+        cleanupOpenCL();
+        glfwTerminate();
+        return -1;
+    }
+    
+    cleanupOpenCL();
     glfwTerminate();
     return 0;
 }

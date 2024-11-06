@@ -1,29 +1,38 @@
 cmake_minimum_required(VERSION 3.10)
 project(BouncingBallsSimulation)
 
-set(CMAKE_CXX_STANDARD 11)
+set(CMAKE_CXX_STANDARD 17)
 
-# Set TBB paths explicitly
-set(TBB_DIR "/opt/homebrew/opt/tbb")
-set(TBB_INCLUDE_DIRS "${TBB_DIR}/include")
-set(TBB_LIBRARIES "${TBB_DIR}/lib/libtbb.dylib")
+# Find OpenCL
+find_package(OpenCL REQUIRED)
 
-# Add the source files
-add_executable(BouncingBalls main.cpp)
+# Set up framework paths for macOS
+set(CMAKE_OSX_SYSROOT "/Applications/Xcode.app/Contents/Developer/Platforms/MacOSX.platform/Developer/SDKs/MacOSX.sdk")
 
-# Include GLFW
-include_directories(/opt/homebrew/opt/glfw/include)
-find_library(GLFW_LIBRARY glfw PATHS /opt/homebrew/opt/glfw/lib)
-target_link_libraries(BouncingBalls ${GLFW_LIBRARY})
+# Set GLFW paths
+set(GLFW_DIR "/opt/homebrew/opt/glfw")
+include_directories(${GLFW_DIR}/include)
+find_library(GLFW_LIBRARY glfw PATHS ${GLFW_DIR}/lib)
 
 # Include OpenGL
 find_library(OpenGL_LIBRARY OpenGL)
-target_link_libraries(BouncingBalls ${OpenGL_LIBRARY})
 
-# Include and link TBB
-include_directories(${TBB_INCLUDE_DIRS})
-target_link_libraries(BouncingBalls ${TBB_LIBRARIES})
+# Add the executable
+add_executable(BouncingBalls main.cpp)
 
-# Print TBB paths for debugging
-message(STATUS "TBB_INCLUDE_DIRS: ${TBB_INCLUDE_DIRS}")
-message(STATUS "TBB_LIBRARIES: ${TBB_LIBRARIES}")
+# Include directories for macOS
+target_include_directories(BouncingBalls PRIVATE 
+    ${OpenCL_INCLUDE_DIRS}
+    ${GLFW_DIR}/include
+    "/System/Library/Frameworks/OpenCL.framework/Headers"
+)
+
+# Link frameworks and libraries
+target_link_libraries(BouncingBalls
+    "-framework OpenCL"
+    ${GLFW_LIBRARY}
+    ${OpenGL_LIBRARY}
+)
+
+# Copy kernel file to build directory
+configure_file(${CMAKE_SOURCE_DIR}/kernel.cl ${CMAKE_BINARY_DIR}/kernel.cl COPYONLY)
