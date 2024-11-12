@@ -104,35 +104,33 @@ void initializeBalls(int numBalls) {
     srand(static_cast<unsigned int>(time(0)));
     balls.resize(numBalls);
     
-    // Fixed starting positions for debugging
-    float positions_init[5][2] = {
-        {200, 300}, {400, 300}, {600, 300}, {300, 450}, {500, 450}
-    };
-    float velocities_init[5][2] = {
-        {2.0f, 0.0f}, {-2.0f, 0.0f}, {2.0f, 0.0f}, {-2.0f, 0.0f}, {2.0f, 0.0f}
-    };
-    
-    std::cout << "Initializing balls:" << std::endl;
-    
     // Create separate vectors for each component
     std::vector<cl_float4> positions(numBalls);
     std::vector<cl_float4> velocities(numBalls);
     std::vector<cl_float4> colors(numBalls);
     
+    // radius
+    float radius_options[] = {50.0f, 100.0f, 150.0f};
+    
+    std::cout << "Initializing balls:" << std::endl;
+    
     for (int i = 0; i < numBalls; ++i) {
-        // Set up positions
-        positions[i].s[0] = positions_init[i][0];    // x
-        positions[i].s[1] = positions_init[i][1];    // y
-        positions[i].s[2] = 50.0f;                   // radius
-        positions[i].s[3] = 0.0f;                    // padding
+        // Random radius (50, 100, or 150)
+        float radius = radius_options[rand() % 3];
         
-        // Set up velocities
-        velocities[i].s[0] = velocities_init[i][0];  // vx
-        velocities[i].s[1] = velocities_init[i][1];  // vy
-        velocities[i].s[2] = 0.0f;                   // padding
-        velocities[i].s[3] = 0.0f;                   // padding
+        // Random position (ensuring ball doesn't spawn partially outside window)
+        positions[i].s[0] = radius + (rand() % (int)(1200 - 2 * radius));    // x
+        positions[i].s[1] = radius + (rand() % (int)(900 - 2 * radius));    // y
+        positions[i].s[2] = radius;                                         // radius
+        positions[i].s[3] = 0.0f;                                          // padding
         
-        // Set up colors
+        // Random velocity (-1.0 to 1.0 for both x and y)
+        velocities[i].s[0] = (float)(rand() % 200 - 100) / 50.0f;  // vx
+        velocities[i].s[1] = (float)(rand() % 200 - 100) / 50.0f;  // vy
+        velocities[i].s[2] = 0.0f;                                 // padding
+        velocities[i].s[3] = 0.0f;                                 // padding
+        
+        // Colors (red, green, or blue)
         if (i % 3 == 0) {
             colors[i].s[0] = 1.0f; colors[i].s[1] = 0.0f; colors[i].s[2] = 0.0f;  // Red
         } else if (i % 3 == 1) {
@@ -149,7 +147,8 @@ void initializeBalls(int numBalls) {
         
         std::cout << "Ball " << i << ": "
                   << "pos=(" << positions[i].s[0] << "," << positions[i].s[1] << ") "
-                  << "vel=(" << velocities[i].s[0] << "," << velocities[i].s[1] << ")"
+                  << "vel=(" << velocities[i].s[0] << "," << velocities[i].s[1] << ") "
+                  << "radius=" << positions[i].s[2]
                   << std::endl;
     }
     
@@ -168,7 +167,7 @@ void initializeBalls(int numBalls) {
         sizeof(cl_float4) * numBalls, nullptr, &error);
     checkError(error, "clCreateBuffer colors");
     
-    // Copy data to device using the separate vectors
+    // Copy data to device
     error = clEnqueueWriteBuffer(queue, d_positions, CL_TRUE, 0,
         sizeof(cl_float4) * numBalls, positions.data(), 0, nullptr, nullptr);
     checkError(error, "clEnqueueWriteBuffer positions");
@@ -245,7 +244,7 @@ void cleanupOpenCL() {
 int main() {
     if (!glfwInit()) return -1;
     
-    GLFWwindow* window = glfwCreateWindow(800, 600, "OpenCL 2D Bouncing Balls", NULL, NULL);
+    GLFWwindow* window = glfwCreateWindow(1200, 900, "OpenCL 2D Bouncing Balls", NULL, NULL);
     if (!window) {
         glfwTerminate();
         return -1;
@@ -254,10 +253,10 @@ int main() {
     glfwMakeContextCurrent(window);
     
     // Initialize OpenGL
-    glViewport(0, 0, 800, 600);
+    glViewport(0, 0, 1200, 900);
     glMatrixMode(GL_PROJECTION);
     glLoadIdentity();
-    glOrtho(0, 800, 0, 600, -1, 1);
+    glOrtho(0, 1200, 0, 900, -1, 1);
     glMatrixMode(GL_MODELVIEW);
     glLoadIdentity();
     glClearColor(0.0f, 0.0f, 0.0f, 1.0f);
@@ -284,11 +283,11 @@ int main() {
         error = clSetKernelArg(kernel, 4, sizeof(float), &gravity);
         checkError(error, "clSetKernelArg 4");
         
-        float window_width = 800.0f;
+        float window_width = 1200.0f;
         error = clSetKernelArg(kernel, 5, sizeof(float), &window_width);
         checkError(error, "clSetKernelArg 5");
         
-        float window_height = 600.0f;
+        float window_height = 900.0f;
         error = clSetKernelArg(kernel, 6, sizeof(float), &window_height);
         checkError(error, "clSetKernelArg 6");
         
